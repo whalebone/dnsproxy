@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/whalebone/dnsproxy/internal/bootstrap"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/testutil"
@@ -25,6 +24,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/whalebone/dnsproxy/internal/bootstrap"
 )
 
 func TestUpstreamDoH(t *testing.T) {
