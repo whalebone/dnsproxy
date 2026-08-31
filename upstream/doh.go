@@ -466,6 +466,21 @@ func (p *dnsOverHTTPS) createClient() (*http.Client, error) {
 // HTTP3 is enabled in the upstream options).  If this attempt is successful,
 // it returns an HTTP3 transport, otherwise it returns the H1/H2 transport.
 func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
+	tlsConf := p.tlsConf.Clone()
+
+	if p.proxy != nil {
+		// A proxied request needs no bootstrap at all: [http.Transport] dials
+		// the proxy, and the proxy resolves this upstream's hostname itself.
+		// So the bootstrap is deferred to the dial handler, which needs it only
+		// if a request turns out to be sent directly.  Otherwise a network that
+		// permits no plain DNS, which is the very reason to use a proxy, could
+		// not bring this upstream up at all.
+		//
+		// Note that HTTP/3 cannot be reached from here, since [newDoH] rejects
+		// a proxy combined with it.
+		return p.newTransportH1H2(tlsConf, p.proxyDialContext())
+	}
+
 	dialContext, err := p.getDialer()
 	if err != nil {
 		return nil, fmt.Errorf("bootstrapping %s: %w", p.addrRedacted, err)
@@ -474,7 +489,6 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 	// First, we attempt to create an HTTP3 transport.  If the probe QUIC
 	// connection is established successfully, we'll be using HTTP3 for this
 	// upstream.
-	tlsConf := p.tlsConf.Clone()
 	transportH3, err := p.createTransportH3(tlsConf, dialContext)
 	if err == nil {
 		p.logger.Debug("using http/3 for this upstream, quic was faster")
@@ -484,6 +498,16 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 
 	p.logger.Debug("got error, switching to http/2 for this upstream", slogutil.KeyError, err)
 
+	return p.newTransportH1H2(tlsConf, dialContext)
+}
+
+// newTransportH1H2 returns an HTTP/1.1 and HTTP/2 transport for this upstream
+// that dials with dialContext.  Note that it also sets p.transportH2, so that
+// the HTTP/2 transport can be configured after the fact.
+func (p *dnsOverHTTPS) newTransportH1H2(
+	tlsConf *tls.Config,
+	dialContext bootstrap.DialHandler,
+) (t http.RoundTripper, err error) {
 	if !p.supportsHTTP() {
 		return nil, errors.Error("HTTP1/1 and HTTP2 are not supported by this upstream")
 	}
@@ -492,7 +516,7 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 		TLSClientConfig:    tlsConf,
 		Proxy:              p.proxy,
 		DisableCompression: true,
-		DialContext:        p.transportDialContext(dialContext),
+		DialContext:        dialContext,
 		IdleConnTimeout:    transportDefaultIdleConnTimeout,
 		MaxConnsPerHost:    dohMaxConnsPerHost,
 		MaxIdleConns:       dohMaxIdleConns,
@@ -516,21 +540,19 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 	return transport, nil
 }
 
-// transportDialContext returns the dial handler for the H1/H2 transport.  boot
-// dials the bootstrapped addresses of this upstream regardless of the address
-// it is asked for, which is wrong once a proxy is in play: [http.Transport]
-// asks for the proxy's address, not the upstream's.  So when a proxy may be
-// used, anything but the upstream's own address is dialed as given.
+// proxyDialContext returns the dial handler for an upstream that has a proxy
+// configured.  The bootstrap dials the bootstrapped addresses of this upstream
+// regardless of the address it is asked for, which is wrong once a proxy is in
+// play: [http.Transport] asks for the proxy's address, not the upstream's.  So
+// anything but the upstream's own address is dialed as given.
 //
-// Note that this means a proxy hostname is resolved by the system resolver,
-// since the bootstrap of this upstream only knows how to reach the upstream.
-func (p *dnsOverHTTPS) transportDialContext(
-	boot bootstrap.DialHandler,
-) (h bootstrap.DialHandler) {
-	if p.proxy == nil {
-		return boot
-	}
-
+// The bootstrap is initialized here rather than by the caller, so that it only
+// runs if the upstream's own address is dialed, that is, if [Options.Proxy]
+// returned no proxy for a request.
+//
+// Note that a proxy hostname is resolved by the system resolver, since the
+// bootstrap of this upstream only knows how to reach the upstream.
+func (p *dnsOverHTTPS) proxyDialContext() (h bootstrap.DialHandler) {
 	upsAddr := transportAddr(p.addr)
 	dialer := &net.Dialer{
 		Timeout: p.timeout,
@@ -541,13 +563,22 @@ func (p *dnsOverHTTPS) transportDialContext(
 		network bootstrap.Network,
 		addr string,
 	) (conn net.Conn, err error) {
-		if strings.EqualFold(addr, upsAddr) {
-			return boot(ctx, network, addr)
+		if !strings.EqualFold(addr, upsAddr) {
+			p.logger.DebugContext(ctx, "dialing proxy", "addr", addr)
+
+			return dialer.DialContext(ctx, network, addr)
 		}
 
-		p.logger.DebugContext(ctx, "dialing proxy", "addr", addr)
+		// Note that the bootstrap runs on its own context with the upstream
+		// timeout, see [bootstrap.ResolveDialContext], so ctx does not cancel
+		// it.  A stalled bootstrap therefore holds this dial for up to that
+		// timeout even if the request is already gone.
+		boot, err := p.getDialer()
+		if err != nil {
+			return nil, fmt.Errorf("bootstrapping %s: %w", p.addrRedacted, err)
+		}
 
-		return dialer.DialContext(ctx, network, addr)
+		return boot(ctx, network, addr)
 	}
 }
 

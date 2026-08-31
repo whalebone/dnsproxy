@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/robcza/dnsproxy/internal/bootstrap"
+	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/miekg/dns"
@@ -542,35 +544,58 @@ func createDoHHandler() (h http.Handler) {
 	return mux
 }
 
+// testProxyTimeout is the upstream timeout used by the proxy tests, long
+// enough not to fire before the assertion under test.
+const testProxyTimeout = 5 * time.Second
+
 func TestUpstreamDoH_proxy(t *testing.T) {
 	t.Parallel()
 
 	testCases := []struct {
-		name         string
-		host         string
-		bootstrap    Resolver
-		useProxy     bool
-		wantConnects int64
+		name                string
+		host                string
+		bootstrap           Resolver
+		wantConnects        int64
+		useProxy            bool
+		proxyReturnsURL     bool
+		proxyResolvesTarget bool
 	}{{
-		name:         "through_proxy",
-		host:         "",
-		bootstrap:    nil,
-		useProxy:     true,
-		wantConnects: 1,
+		name:                "through_proxy",
+		host:                "",
+		bootstrap:           nil,
+		wantConnects:        1,
+		useProxy:            true,
+		proxyReturnsURL:     true,
+		proxyResolvesTarget: false,
 	}, {
-		name:         "direct_without_proxy",
-		host:         "",
-		bootstrap:    nil,
-		useProxy:     false,
-		wantConnects: 0,
+		name:                "direct_without_proxy",
+		host:                "",
+		bootstrap:           nil,
+		wantConnects:        0,
+		useProxy:            false,
+		proxyReturnsURL:     false,
+		proxyResolvesTarget: false,
 	}, {
 		// A proxy func that returns no proxy must still reach the upstream
 		// through its bootstrap, not through the system resolver.
-		name:         "bootstrapped_host_without_proxy_url",
-		host:         "dns.example",
-		bootstrap:    StaticResolver{netip.MustParseAddr("127.0.0.1")},
-		useProxy:     true,
-		wantConnects: 0,
+		name:                "bootstrapped_host_without_proxy_url",
+		host:                "dns.example",
+		bootstrap:           StaticResolver{netip.MustParseAddr("127.0.0.1")},
+		wantConnects:        0,
+		useProxy:            true,
+		proxyReturnsURL:     false,
+		proxyResolvesTarget: false,
+	}, {
+		// A proxied request needs no bootstrap at all, since the proxy resolves
+		// the upstream's hostname itself.  So a host that this machine cannot
+		// resolve, and no bootstrap to resolve it with, must still work.
+		name:                "unresolvable_host_through_proxy",
+		host:                "unresolvable.invalid",
+		bootstrap:           nil,
+		wantConnects:        1,
+		useProxy:            true,
+		proxyReturnsURL:     true,
+		proxyResolvesTarget: true,
 	}}
 
 	for _, tc := range testCases {
@@ -578,7 +603,6 @@ func TestUpstreamDoH_proxy(t *testing.T) {
 			t.Parallel()
 
 			srv := startDoHServer(t, testDoHServerOptions{})
-			prx := startTestHTTPProxy(t)
 
 			srvAddr := srv.addr
 			if tc.host != "" {
@@ -588,10 +612,17 @@ func TestUpstreamDoH_proxy(t *testing.T) {
 				srvAddr = net.JoinHostPort(tc.host, port)
 			}
 
+			proxyTarget := ""
+			if tc.proxyResolvesTarget {
+				proxyTarget = srv.addr
+			}
+
+			prx := startTestHTTPProxy(t, proxyTarget)
+
 			var proxyFunc ProxyFunc
 			if tc.useProxy {
 				proxyFunc = func(_ *http.Request) (proxyURL *url.URL, err error) {
-					if tc.host != "" {
+					if !tc.proxyReturnsURL {
 						return nil, nil
 					}
 
@@ -614,6 +645,96 @@ func TestUpstreamDoH_proxy(t *testing.T) {
 			assert.Equal(t, tc.wantConnects, prx.connects.Load())
 		})
 	}
+}
+
+// TestUpstreamDoH_proxyDirectBootstrapFailure asserts that deferring the
+// bootstrap of a proxied upstream doesn't swallow its failure: a request that
+// the proxy func sends directly still reports that the upstream could not be
+// bootstrapped.
+func TestUpstreamDoH_proxyDirectBootstrapFailure(t *testing.T) {
+	t.Parallel()
+
+	u, err := AddressToUpstream("https://dns.example/dns-query", &Options{
+		Logger:    slogutil.NewDiscardLogger(),
+		Bootstrap: errTestResolver{},
+		Timeout:   testProxyTimeout,
+		Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+			return nil, nil
+		},
+	})
+	require.NoError(t, err)
+	testutil.CleanupAndRequireSuccess(t, u.Close)
+
+	_, err = u.Exchange(createTestMessage())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bootstrapping")
+}
+
+// TestUpstreamDoH_proxyThenDirect asserts that an upstream which has already
+// served a proxied request can still fall back to a direct one, initializing
+// its bootstrap only then.
+//
+// Note that [Options.Proxy] is consulted only when a new connection is needed,
+// not per request: with HTTP/2 the established tunnel is reused for the same
+// authority whatever the proxy func says.  So the test closes it in between.
+func TestUpstreamDoH_proxyThenDirect(t *testing.T) {
+	t.Parallel()
+
+	srv := startDoHServer(t, testDoHServerOptions{})
+	prx := startTestHTTPProxy(t, srv.addr)
+
+	_, port, err := net.SplitHostPort(srv.addr)
+	require.NoError(t, err)
+
+	// Use a hostname that only the bootstrap can resolve, so that the direct
+	// request cannot succeed without it.
+	address := fmt.Sprintf("https://%s/dns-query", net.JoinHostPort("dns.example", port))
+
+	proxied := &atomic.Bool{}
+	proxied.Store(true)
+
+	u, err := AddressToUpstream(address, &Options{
+		Logger:             slogutil.NewDiscardLogger(),
+		InsecureSkipVerify: true,
+		Bootstrap:          StaticResolver{netip.MustParseAddr("127.0.0.1")},
+		Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+			if !proxied.Load() {
+				return nil, nil
+			}
+
+			return prx.url, nil
+		},
+	})
+	require.NoError(t, err)
+	testutil.CleanupAndRequireSuccess(t, u.Close)
+
+	checkUpstream(t, u, address)
+	require.Equal(t, int64(1), prx.connects.Load())
+
+	transport := testutil.RequireTypeAssert[*http.Transport](t, u.(*dnsOverHTTPS).client.Transport)
+	transport.CloseIdleConnections()
+	proxied.Store(false)
+
+	checkUpstream(t, u, address)
+
+	assert.Equal(t, int64(1), prx.connects.Load())
+}
+
+// errTestResolver is a [Resolver] that always fails.  It exercises bootstrap
+// failures without depending on the resolver of the machine running the test.
+type errTestResolver struct{}
+
+// type check
+var _ Resolver = errTestResolver{}
+
+// LookupNetIP implements the [Resolver] interface for errTestResolver.
+func (errTestResolver) LookupNetIP(
+	_ context.Context,
+	_ bootstrap.Network,
+	_ string,
+) (addrs []netip.Addr, err error) {
+	return nil, errors.Error("test resolver failure")
 }
 
 func TestUpstreamDoH_proxyRejectsHTTP3(t *testing.T) {
@@ -659,14 +780,21 @@ type testHTTPProxy struct {
 
 	// connects counts the CONNECT requests that reached this proxy.
 	connects *atomic.Int64
+
+	// target is the address to tunnel to, regardless of what the CONNECT
+	// request asks for.  If empty, the request's own host is used.
+	target string
 }
 
-// startTestHTTPProxy starts an HTTP proxy on a random port.  Note that it adds
-// its own shutdown to the cleanup of t.
-func startTestHTTPProxy(t *testing.T) (p *testHTTPProxy) {
+// startTestHTTPProxy starts an HTTP proxy on a random port.  If target is not
+// empty, the proxy tunnels to it instead of to the host of the CONNECT request,
+// emulating a proxy that resolves the target's hostname itself.  Note that it
+// adds its own shutdown to the cleanup of t.
+func startTestHTTPProxy(t *testing.T, target string) (p *testHTTPProxy) {
 	t.Helper()
 
 	p = &testHTTPProxy{
+		target:   target,
 		connects: &atomic.Int64{},
 	}
 
@@ -704,7 +832,12 @@ func (p *testHTTPProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	p.connects.Add(1)
 
-	targetConn, err := net.Dial("tcp", r.Host)
+	targetAddr := p.target
+	if targetAddr == "" {
+		targetAddr = r.Host
+	}
+
+	targetConn, err := net.Dial("tcp", targetAddr)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 
