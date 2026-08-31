@@ -622,6 +622,13 @@ func transportAddr(u *url.URL) (addr string) {
 	// internationalized domain name still matches.  A host that cannot be
 	// converted is compared as is: the worst case is that it never matches,
 	// and the upstream is dialed directly instead of through its bootstrap.
+	//
+	// The transport skips the conversion for an ASCII host, keeping its case,
+	// while [idna.Lookup] folds it; a host the lookup profile rejects falls
+	// back to the verbatim host here, which is what the transport dials too.
+	// Case is therefore the only divergence between the two derivations, and
+	// the comparison in [dnsOverHTTPS.proxyDialContext] absorbs it with
+	// [strings.EqualFold].
 	if ascii, err := idna.Lookup.ToASCII(host); err == nil {
 		host = ascii
 	}

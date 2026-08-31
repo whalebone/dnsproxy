@@ -586,6 +586,27 @@ func TestUpstreamDoH_proxy(t *testing.T) {
 		proxyReturnsURL:     false,
 		proxyResolvesTarget: false,
 	}, {
+		// The upstream's address must match the dial target through the
+		// punycode conversion [http.Transport] applies, or the bootstrap
+		// branch is silently skipped.
+		name:                "idn_host_without_proxy_url",
+		host:                "bücher.example",
+		bootstrap:           StaticResolver{netip.MustParseAddr("127.0.0.1")},
+		wantConnects:        0,
+		useProxy:            true,
+		proxyReturnsURL:     false,
+		proxyResolvesTarget: false,
+	}, {
+		// [http.Transport] dials an ASCII host with its case preserved, while
+		// [transportAddr] folds it, so the match must be case-insensitive.
+		name:                "uppercase_host_without_proxy_url",
+		host:                "DNS.EXAMPLE",
+		bootstrap:           StaticResolver{netip.MustParseAddr("127.0.0.1")},
+		wantConnects:        0,
+		useProxy:            true,
+		proxyReturnsURL:     false,
+		proxyResolvesTarget: false,
+	}, {
 		// A proxied request needs no bootstrap at all, since the proxy resolves
 		// the upstream's hostname itself.  So a host that this machine cannot
 		// resolve, and no bootstrap to resolve it with, must still work.
@@ -903,6 +924,82 @@ func TestUpstreamDoH_directThenProxy(t *testing.T) {
 	checkUpstream(t, u, address)
 
 	assert.Equal(t, int64(0), prx.connects.Load())
+}
+
+// TestTransportAddr asserts that the address [transportAddr] derives matches
+// what [http.Transport] dials, over the host shapes that differ under the
+// conversion: internationalized names, punycode, case, and the hosts the
+// lookup profile rejects, which must fall back to the verbatim host.
+func TestTransportAddr(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		host string
+		want string
+	}{{
+		name: "ascii",
+		host: "dns.example:443",
+		want: "dns.example:443",
+	}, {
+		name: "ascii_upper",
+		host: "DNS.EXAMPLE:443",
+		want: "dns.example:443",
+	}, {
+		name: "trailing_dot",
+		host: "dns.example.:443",
+		want: "dns.example.:443",
+	}, {
+		name: "punycode",
+		host: "xn--bcher-kva.example:443",
+		want: "xn--bcher-kva.example:443",
+	}, {
+		name: "punycode_upper",
+		host: "XN--BCHER-KVA.example:443",
+		want: "xn--bcher-kva.example:443",
+	}, {
+		name: "idn",
+		host: "bücher.example:443",
+		want: "xn--bcher-kva.example:443",
+	}, {
+		name: "idn_nontransitional",
+		host: "faß.de:443",
+		want: "xn--fa-hia.de:443",
+	}, {
+		name: "underscore_label",
+		host: "_dmarc.example.com:443",
+		want: "_dmarc.example.com:443",
+	}, {
+		name: "leading_hyphen_label",
+		host: "-foo.example:443",
+		want: "-foo.example:443",
+	}, {
+		name: "empty_label",
+		host: "foo..example:443",
+		want: "foo..example:443",
+	}, {
+		name: "invalid_punycode",
+		host: "xn--a.example:443",
+		want: "xn--a.example:443",
+	}, {
+		name: "ipv4",
+		host: "127.0.0.1:443",
+		want: "127.0.0.1:443",
+	}, {
+		name: "ipv6",
+		host: "[::1]:443",
+		want: "[::1]:443",
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			u := &url.URL{Host: tc.host}
+
+			assert.Equal(t, tc.want, transportAddr(u))
+		})
+	}
 }
 
 // errTestResolver is a [Resolver] that always fails.  It exercises bootstrap
