@@ -647,6 +647,147 @@ func TestUpstreamDoH_proxy(t *testing.T) {
 	}
 }
 
+// TestCheckProxyScheme asserts that the checked proxy func rejects the URL
+// schemes [http.Transport] would connect to with this upstream's own TLS
+// configuration, and passes everything else through untouched.
+func TestCheckProxyScheme(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		scheme     string
+		wantErrMsg string
+	}{{
+		name:       "empty",
+		scheme:     "",
+		wantErrMsg: "",
+	}, {
+		name:       "http",
+		scheme:     "http",
+		wantErrMsg: "",
+	}, {
+		name:       "socks5",
+		scheme:     "socks5",
+		wantErrMsg: "",
+	}, {
+		name:       "socks5h",
+		scheme:     "socks5h",
+		wantErrMsg: "",
+	}, {
+		name:       "https",
+		scheme:     "https",
+		wantErrMsg: `proxy scheme "https" is not supported`,
+	}, {
+		name:       "ftp",
+		scheme:     "ftp",
+		wantErrMsg: `proxy scheme "ftp" is not supported`,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			in := &url.URL{Scheme: tc.scheme, Host: "proxy.example:3128"}
+			checked := checkProxyScheme(func(_ *http.Request) (proxyURL *url.URL, err error) {
+				return in, nil
+			})
+
+			out, err := checked(nil)
+
+			if tc.wantErrMsg == "" {
+				require.NoError(t, err)
+				assert.Same(t, in, out)
+			} else {
+				require.Error(t, err)
+				assert.Equal(t, tc.wantErrMsg, err.Error())
+				assert.Nil(t, out)
+			}
+		})
+	}
+
+	t.Run("nil_func", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Nil(t, checkProxyScheme(nil))
+	})
+
+	t.Run("no_proxy", func(t *testing.T) {
+		t.Parallel()
+
+		checked := checkProxyScheme(func(_ *http.Request) (proxyURL *url.URL, err error) {
+			return nil, nil
+		})
+
+		out, err := checked(nil)
+
+		require.NoError(t, err)
+		assert.Nil(t, out)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		t.Parallel()
+
+		checked := checkProxyScheme(func(_ *http.Request) (proxyURL *url.URL, err error) {
+			return nil, assert.AnError
+		})
+
+		_, err := checked(nil)
+
+		assert.ErrorIs(t, err, assert.AnError)
+	})
+}
+
+// TestUpstreamDoH_proxyScheme asserts the scheme handling end to end: a proxy
+// URL with no scheme, which is what the Windows PAC resolution produces, is
+// used as a plain HTTP proxy, while an https one is rejected before any
+// connection is made.
+func TestUpstreamDoH_proxyScheme(t *testing.T) {
+	t.Parallel()
+
+	srv := startDoHServer(t, testDoHServerOptions{})
+	address := fmt.Sprintf("https://%s/dns-query", srv.addr)
+
+	t.Run("empty_scheme_via_proxy", func(t *testing.T) {
+		t.Parallel()
+
+		prx := startTestHTTPProxy(t, "")
+
+		u, err := AddressToUpstream(address, &Options{
+			Logger:             slogutil.NewDiscardLogger(),
+			InsecureSkipVerify: true,
+			Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+				return &url.URL{Host: prx.url.Host}, nil
+			},
+		})
+		require.NoError(t, err)
+		testutil.CleanupAndRequireSuccess(t, u.Close)
+
+		checkUpstream(t, u, address)
+
+		assert.Equal(t, int64(1), prx.connects.Load())
+	})
+
+	t.Run("https_scheme_rejected", func(t *testing.T) {
+		t.Parallel()
+
+		u, err := AddressToUpstream(address, &Options{
+			Logger:             slogutil.NewDiscardLogger(),
+			InsecureSkipVerify: true,
+			Timeout:            testProxyTimeout,
+			Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+				return &url.URL{Scheme: "https", Host: "proxy.invalid:3128"}, nil
+			},
+		})
+		require.NoError(t, err)
+		testutil.CleanupAndRequireSuccess(t, u.Close)
+
+		_, err = u.Exchange(createTestMessage())
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `proxy scheme "https" is not supported`)
+	})
+}
+
 // TestUpstreamDoH_proxyDirectBootstrapFailure asserts that deferring the
 // bootstrap of a proxied upstream doesn't swallow its failure: a request that
 // the proxy func sends directly still reports that the upstream could not be

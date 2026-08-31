@@ -524,6 +524,7 @@ Note the following constraints:
 - QUIC cannot traverse an HTTP `CONNECT` proxy, so `Proxy` cannot be combined with HTTP/3.  `AddressToUpstream` returns an error if `Proxy` is set together with `HTTPVersion3` in `HTTPVersions`, or with an `h3://` upstream address.
 - A proxied request needs no bootstrap: the proxy resolves the upstream's hostname itself, so no plain DNS lookup of the upstream is made.  The bootstrap is only used for a request that `Proxy` sends directly, and a bootstrap failure is then reported by that request rather than at upstream creation.
 - A proxy hostname, on the other hand, is resolved by the system resolver, not by the upstream's bootstrap.
+- The proxy URL scheme must be `http`, `socks5`, or `socks5h`; an empty scheme is treated as `http`.  An `https://` proxy is rejected: the transport would run the proxy TLS handshake with the upstream's own TLS configuration, verifying the proxy's certificate against the upstream's name and offering the upstream's client certificate to the proxy.
 - There is no command-line or configuration-file equivalent; `Proxy` is a library-only option.
 
 [http-transport-proxy]: https://pkg.go.dev/net/http#Transport

@@ -141,7 +141,7 @@ func newDoH(addr *url.URL, opts *Options) (u Upstream, err error) {
 
 	ups := &dnsOverHTTPS{
 		getDialer: newDialerInitializer(addr, opts),
-		proxy:     opts.Proxy,
+		proxy:     checkProxyScheme(opts.Proxy),
 		addr:      addr,
 		quicConf: &quic.Config{
 			KeepAlivePeriod: QUICKeepAlivePeriod,
@@ -538,6 +538,36 @@ func (p *dnsOverHTTPS) newTransportH1H2(
 	p.transportH2.ReadIdleTimeout = transportDefaultReadIdleTimeout
 
 	return transport, nil
+}
+
+// checkProxyScheme wraps proxy to reject the URL schemes that [http.Transport]
+// would connect to using this upstream's own TLS configuration.  That
+// configuration pins the upstream's server name, root pool, and client
+// certificate, none of which apply to a proxy, so an "https" proxy would fail
+// its certificate verification and be offered the upstream's client
+// certificate.  An empty scheme is accepted since the transport treats it as
+// "http"; the Windows PAC resolution produces such URLs.
+//
+// It is applied here, per returned URL, rather than at construction, since a
+// proxy func may return a different URL for every request.
+func checkProxyScheme(proxy ProxyFunc) (checked ProxyFunc) {
+	if proxy == nil {
+		return nil
+	}
+
+	return func(req *http.Request) (proxyURL *url.URL, err error) {
+		proxyURL, err = proxy(req)
+		if err != nil || proxyURL == nil {
+			return proxyURL, err
+		}
+
+		switch proxyURL.Scheme {
+		case "", "http", "socks5", "socks5h":
+			return proxyURL, nil
+		default:
+			return nil, fmt.Errorf("proxy scheme %q is not supported", proxyURL.Scheme)
+		}
+	}
 }
 
 // proxyDialContext returns the dial handler for an upstream that has a proxy
