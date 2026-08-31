@@ -86,12 +86,22 @@ type Options struct {
 	// Proxy is an optional callback returning the proxy to send a
 	// DNS-over-HTTPS request through.  If nil, requests are sent directly.
 	//
+	// It is consulted when a new connection is needed, not per request.  A
+	// pooled HTTP/2 connection to the upstream is reused whatever Proxy would
+	// now return, in both directions: a direct connection established while
+	// Proxy returned nil keeps bypassing a proxy it has started returning,
+	// and a proxied tunnel keeps carrying requests it would now send
+	// directly.  On a proxy configuration change, close this upstream and
+	// create a new one rather than waiting for a failed exchange to reset the
+	// connection.
+	//
 	// QUIC cannot traverse an HTTP CONNECT proxy, so Proxy must not be
 	// combined with [HTTPVersion3]; doing so is an error.  Note that it has no
 	// effect on protocols other than DNS-over-HTTPS.
 	//
 	// The returned URL's scheme must be "http", "socks5", "socks5h", or empty,
-	// which is treated as "http".  An "https" proxy is rejected per request:
+	// which is treated as "http".  An "https" proxy URL is rejected when
+	// returned:
 	// [http.Transport] would run the TLS handshake with the proxy using this
 	// upstream's own TLS configuration, whose server name, root pool, and
 	// client certificate all belong to the upstream, not the proxy.

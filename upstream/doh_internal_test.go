@@ -862,6 +862,49 @@ func TestUpstreamDoH_proxyThenDirect(t *testing.T) {
 	assert.Equal(t, int64(1), prx.connects.Load())
 }
 
+// TestUpstreamDoH_directThenProxy pins that a pooled HTTP/2 connection
+// bypasses [Options.Proxy] in the direction that matters for policy: an
+// upstream that has served a direct request keeps using the pooled connection
+// even after the proxy func starts returning a proxy.  A consumer whose proxy
+// configuration changed must close this upstream and create a new one.
+//
+// If a Go or x/net update starts consulting the proxy func on the pooled
+// path, this test fails, surfacing the semantics change instead of letting it
+// happen silently.
+func TestUpstreamDoH_directThenProxy(t *testing.T) {
+	t.Parallel()
+
+	srv := startDoHServer(t, testDoHServerOptions{})
+	prx := startTestHTTPProxy(t, srv.addr)
+
+	address := fmt.Sprintf("https://%s/dns-query", srv.addr)
+
+	proxied := &atomic.Bool{}
+
+	u, err := AddressToUpstream(address, &Options{
+		Logger:             slogutil.NewDiscardLogger(),
+		InsecureSkipVerify: true,
+		Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+			if !proxied.Load() {
+				return nil, nil
+			}
+
+			return prx.url, nil
+		},
+	})
+	require.NoError(t, err)
+	testutil.CleanupAndRequireSuccess(t, u.Close)
+
+	checkUpstream(t, u, address)
+	require.Equal(t, int64(0), prx.connects.Load())
+
+	proxied.Store(true)
+
+	checkUpstream(t, u, address)
+
+	assert.Equal(t, int64(0), prx.connects.Load())
+}
+
 // errTestResolver is a [Resolver] that always fails.  It exercises bootstrap
 // failures without depending on the resolver of the machine running the test.
 type errTestResolver struct{}
