@@ -1,7 +1,7 @@
 package proxy
 
 import (
-	"github.com/robcza/dnsproxy/proxyutil"
+	"github.com/whalebone/dnsproxy/proxyutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/miekg/dns"
 )

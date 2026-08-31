@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"net/netip"
 
-	"github.com/robcza/dnsproxy/upstream"
+	"github.com/whalebone/dnsproxy/upstream"
 	"github.com/ameshkov/dnscrypt/v2"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
@@ -170,7 +170,7 @@ func (dctx *DNSContext) scrub() {
 	// RFC-6891 (https://tools.ietf.org/html/rfc6891) states that response
 	// mustn't contain an EDNS0 RR if the request doesn't include it.
 	//
-	// See https://github.com/robcza/dnsproxy/issues/132.
+	// See https://github.com/AdguardTeam/dnsproxy/issues/132.
 	if dctx.hasEDNS0 && dctx.Res.IsEdns0() == nil {
 		dctx.Res.SetEdns0(dctx.udpSize, dctx.doBit)
 	}

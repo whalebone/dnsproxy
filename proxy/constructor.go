@@ -1,7 +1,7 @@
 package proxy
 
 import (
-	"github.com/robcza/dnsproxy/internal/dnsmsg"
+	"github.com/whalebone/dnsproxy/internal/dnsmsg"
 )
 
 // MessageConstructor creates DNS messages.

@@ -1,4 +1,4 @@
-module github.com/robcza/dnsproxy
+module github.com/whalebone/dnsproxy
 
 go 1.24.2
 

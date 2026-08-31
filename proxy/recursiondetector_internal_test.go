@@ -154,7 +154,7 @@ func BenchmarkMsgToSignature(b *testing.B) {
 	//
 	//	goos: darwin
 	//	goarch: amd64
-	//	pkg: github.com/robcza/dnsproxy/proxy
+	//	pkg: github.com/whalebone/dnsproxy/proxy
 	//	cpu: Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz
 	//	BenchmarkMsgToSignature/efficient-12         	18789852	        61.07 ns/op	     288 B/op	       1 allocs/op
 	//	BenchmarkMsgToSignature/inefficient-12       	  582990	      2016 ns/op	     624 B/op	       3 allocs/op

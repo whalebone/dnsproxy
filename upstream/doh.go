@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/robcza/dnsproxy/internal/bootstrap"
+	"github.com/whalebone/dnsproxy/internal/bootstrap"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/httphdr"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
@@ -39,7 +39,7 @@ const (
 
 	// dohMaxConnsPerHost controls the maximum number of connections for
 	// each host.  Note, that setting it to 1 may cause issues with Go's http
-	// implementation, see https://github.com/robcza/dnsproxy/issues/278.
+	// implementation, see https://github.com/AdguardTeam/dnsproxy/issues/278.
 	dohMaxConnsPerHost = 2
 
 	// dohMaxIdleConns controls the maximum number of connections being idle
@@ -300,7 +300,7 @@ func (p *dnsOverHTTPS) exchangeHTTPSClient(
 	}
 
 	// Prevent the client from sending User-Agent header, see
-	// https://github.com/robcza/dnsproxy/issues/211.
+	// https://github.com/AdguardTeam/dnsproxy/issues/211.
 	httpReq.Header.Set(httphdr.UserAgent, "")
 	httpReq.Header.Set(httphdr.Accept, "application/dns-message")
 
@@ -528,7 +528,7 @@ func (p *dnsOverHTTPS) newTransportH1H2(
 
 	// Explicitly configure transport to use HTTP/2.
 	//
-	// See https://github.com/robcza/dnsproxy/issues/11.
+	// See https://github.com/AdguardTeam/dnsproxy/issues/11.
 	p.transportH2, err = http2.ConfigureTransports(transport)
 	if err != nil {
 		return nil, err

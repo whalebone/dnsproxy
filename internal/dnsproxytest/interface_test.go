@@ -1,9 +1,9 @@
 package dnsproxytest_test
 
 import (
-	"github.com/robcza/dnsproxy/internal/dnsmsg"
-	"github.com/robcza/dnsproxy/internal/dnsproxytest"
-	"github.com/robcza/dnsproxy/upstream"
+	"github.com/whalebone/dnsproxy/internal/dnsmsg"
+	"github.com/whalebone/dnsproxy/internal/dnsproxytest"
+	"github.com/whalebone/dnsproxy/upstream"
 )
 
 // type checks

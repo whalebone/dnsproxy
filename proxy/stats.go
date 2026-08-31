@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/robcza/dnsproxy/upstream"
+	"github.com/whalebone/dnsproxy/upstream"
 	"github.com/miekg/dns"
 )
 
