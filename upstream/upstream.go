@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
@@ -53,6 +54,11 @@ type QUICTraceFunc func(
 	connID quic.ConnectionID,
 ) (tracer *logging.ConnectionTracer)
 
+// ProxyFunc returns the proxy through which a request should be sent, in the
+// same way as [http.Transport.Proxy].  A nil URL means the request is sent
+// directly.
+type ProxyFunc func(req *http.Request) (proxyURL *url.URL, err error)
+
 // Options for AddressToUpstream func.  With these options we can configure the
 // upstream properties.
 type Options struct {
@@ -76,6 +82,14 @@ type Options struct {
 	// QUICTracer is an optional callback that allows tracing every QUIC
 	// connection and logging every packet that goes through.
 	QUICTracer QUICTraceFunc
+
+	// Proxy is an optional callback returning the proxy to send a
+	// DNS-over-HTTPS request through.  If nil, requests are sent directly.
+	//
+	// QUIC cannot traverse an HTTP CONNECT proxy, so Proxy must not be
+	// combined with [HTTPVersion3]; doing so is an error.  Note that it has no
+	// effect on protocols other than DNS-over-HTTPS.
+	Proxy ProxyFunc
 
 	// RootCAs is the CertPool that must be used by all upstreams.  Redefining
 	// RootCAs makes sense on iOS to overcome the 15MB memory limit of the
@@ -130,6 +144,7 @@ func (o *Options) Clone() (clone *Options) {
 		Logger:                    o.Logger,
 		ClientCertPath:            o.ClientCertPath,
 		ClientKeyPath:             o.ClientKeyPath,
+		Proxy:                     o.Proxy,
 	}
 }
 

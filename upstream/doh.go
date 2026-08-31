@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/idna"
 )
 
 // Values to configure HTTP and HTTP/2 transport.
@@ -44,12 +47,21 @@ const (
 	dohMaxIdleConns = 2
 )
 
+// errProxyH3 is returned when a DNS-over-HTTPS upstream is configured with both
+// a proxy and HTTP/3.  QUIC cannot traverse an HTTP CONNECT proxy, so allowing
+// both would send the queries around the proxy instead of through it.
+const errProxyH3 errors.Error = "proxy is not supported for http/3"
+
 // dnsOverHTTPS is a struct that implements the Upstream interface for the
 // DNS-over-HTTPS protocol.
 type dnsOverHTTPS struct {
 	// getDialer either returns an initialized dial handler or creates a new
 	// one.
 	getDialer DialerInitializer
+
+	// proxy returns the proxy to send a request through, or nil for a direct
+	// connection.  It is nil if no proxy is configured at all.
+	proxy ProxyFunc
 
 	// addr is the DNS-over-HTTPS server URL.
 	addr *url.URL
@@ -98,6 +110,10 @@ func newDoH(addr *url.URL, opts *Options) (u Upstream, err error) {
 		httpVersions = DefaultHTTPVersions
 	}
 
+	if opts.Proxy != nil && slices.Contains(httpVersions, HTTPVersion3) {
+		return nil, errProxyH3
+	}
+
 	tlsConf := &tls.Config{
 		ServerName:   addr.Hostname(),
 		RootCAs:      opts.RootCAs,
@@ -125,6 +141,7 @@ func newDoH(addr *url.URL, opts *Options) (u Upstream, err error) {
 
 	ups := &dnsOverHTTPS{
 		getDialer: newDialerInitializer(addr, opts),
+		proxy:     opts.Proxy,
 		addr:      addr,
 		quicConf: &quic.Config{
 			KeepAlivePeriod: QUICKeepAlivePeriod,
@@ -473,8 +490,9 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 
 	transport := &http.Transport{
 		TLSClientConfig:    tlsConf,
+		Proxy:              p.proxy,
 		DisableCompression: true,
-		DialContext:        dialContext,
+		DialContext:        p.transportDialContext(dialContext),
 		IdleConnTimeout:    transportDefaultIdleConnTimeout,
 		MaxConnsPerHost:    dohMaxConnsPerHost,
 		MaxIdleConns:       dohMaxIdleConns,
@@ -496,6 +514,58 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 	p.transportH2.ReadIdleTimeout = transportDefaultReadIdleTimeout
 
 	return transport, nil
+}
+
+// transportDialContext returns the dial handler for the H1/H2 transport.  boot
+// dials the bootstrapped addresses of this upstream regardless of the address
+// it is asked for, which is wrong once a proxy is in play: [http.Transport]
+// asks for the proxy's address, not the upstream's.  So when a proxy may be
+// used, anything but the upstream's own address is dialed as given.
+//
+// Note that this means a proxy hostname is resolved by the system resolver,
+// since the bootstrap of this upstream only knows how to reach the upstream.
+func (p *dnsOverHTTPS) transportDialContext(
+	boot bootstrap.DialHandler,
+) (h bootstrap.DialHandler) {
+	if p.proxy == nil {
+		return boot
+	}
+
+	upsAddr := transportAddr(p.addr)
+	dialer := &net.Dialer{
+		Timeout: p.timeout,
+	}
+
+	return func(
+		ctx context.Context,
+		network bootstrap.Network,
+		addr string,
+	) (conn net.Conn, err error) {
+		if strings.EqualFold(addr, upsAddr) {
+			return boot(ctx, network, addr)
+		}
+
+		p.logger.DebugContext(ctx, "dialing proxy", "addr", addr)
+
+		return dialer.DialContext(ctx, network, addr)
+	}
+}
+
+// transportAddr returns the host:port of u the way [http.Transport] derives the
+// address it dials, so that the two can be compared.  Note that u always has a
+// port here, since [addPort] has run on it.
+func transportAddr(u *url.URL) (addr string) {
+	host := u.Hostname()
+
+	// Convert to punycode as [http.Transport] does, so that an
+	// internationalized domain name still matches.  A host that cannot be
+	// converted is compared as is: the worst case is that it never matches,
+	// and the upstream is dialed directly instead of through its bootstrap.
+	if ascii, err := idna.Lookup.ToASCII(host); err == nil {
+		host = ascii
+	}
+
+	return net.JoinHostPort(host, u.Port())
 }
 
 // http3Transport is a wrapper over [*http3.Transport] that tries to optimize

@@ -24,6 +24,7 @@ it can work as a `DNS-over-HTTPS`, `DNS-over-TLS` or `DNS-over-QUIC` server.
     - [Bogus NXDomain](#bogus-nxdomain)
     - [Basic Auth for DoH](#basic-auth-for-doh)
     - [Client Certificate Authentication for DoH](#client-certificate-authentication-for-doh)
+    - [Proxying DoH upstreams](#proxying-doh-upstreams)
 
 ## How to install
 
@@ -506,3 +507,22 @@ client-key: "/path/to/client.key"
 ```
 
 This feature also works with DNS-over-TLS (DoT) and DNS-over-QUIC (DoQ) upstreams that require client certificate authentication.
+
+### Proxying DoH upstreams
+
+Library users can route DNS-over-HTTPS upstreams through an HTTP proxy by setting `upstream.Options.Proxy`.  It has the same signature and semantics as [`http.Transport.Proxy`][http-transport-proxy]: it is called per request, and returning a `nil` URL sends that request directly.
+
+```go
+u, err := upstream.AddressToUpstream("https://dns.example.com/dns-query", &upstream.Options{
+	Proxy: http.ProxyFromEnvironment,
+})
+```
+
+Note the following constraints:
+
+- The proxy is used for DoH only.  It has no effect on plain DNS, DoT, DoQ or DNSCrypt upstreams.
+- QUIC cannot traverse an HTTP `CONNECT` proxy, so `Proxy` cannot be combined with HTTP/3.  `AddressToUpstream` returns an error if `Proxy` is set together with `HTTPVersion3` in `HTTPVersions`, or with an `h3://` upstream address.
+- A proxy hostname is resolved by the system resolver, not by the upstream's bootstrap.
+- There is no command-line or configuration-file equivalent; `Proxy` is a library-only option.
+
+[http-transport-proxy]: https://pkg.go.dev/net/http#Transport

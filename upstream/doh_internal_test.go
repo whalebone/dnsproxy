@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -538,4 +540,198 @@ func createDoHHandler() (h http.Handler) {
 	mux.HandleFunc("/dns-query", createDoHHandlerFunc())
 
 	return mux
+}
+
+func TestUpstreamDoH_proxy(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name         string
+		host         string
+		bootstrap    Resolver
+		useProxy     bool
+		wantConnects int64
+	}{{
+		name:         "through_proxy",
+		host:         "",
+		bootstrap:    nil,
+		useProxy:     true,
+		wantConnects: 1,
+	}, {
+		name:         "direct_without_proxy",
+		host:         "",
+		bootstrap:    nil,
+		useProxy:     false,
+		wantConnects: 0,
+	}, {
+		// A proxy func that returns no proxy must still reach the upstream
+		// through its bootstrap, not through the system resolver.
+		name:         "bootstrapped_host_without_proxy_url",
+		host:         "dns.example",
+		bootstrap:    StaticResolver{netip.MustParseAddr("127.0.0.1")},
+		useProxy:     true,
+		wantConnects: 0,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := startDoHServer(t, testDoHServerOptions{})
+			prx := startTestHTTPProxy(t)
+
+			srvAddr := srv.addr
+			if tc.host != "" {
+				_, port, err := net.SplitHostPort(srv.addr)
+				require.NoError(t, err)
+
+				srvAddr = net.JoinHostPort(tc.host, port)
+			}
+
+			var proxyFunc ProxyFunc
+			if tc.useProxy {
+				proxyFunc = func(_ *http.Request) (proxyURL *url.URL, err error) {
+					if tc.host != "" {
+						return nil, nil
+					}
+
+					return prx.url, nil
+				}
+			}
+
+			address := fmt.Sprintf("https://%s/dns-query", srvAddr)
+			u, err := AddressToUpstream(address, &Options{
+				Logger:             slogutil.NewDiscardLogger(),
+				InsecureSkipVerify: true,
+				Bootstrap:          tc.bootstrap,
+				Proxy:              proxyFunc,
+			})
+			require.NoError(t, err)
+			testutil.CleanupAndRequireSuccess(t, u.Close)
+
+			checkUpstream(t, u, address)
+
+			assert.Equal(t, tc.wantConnects, prx.connects.Load())
+		})
+	}
+}
+
+func TestUpstreamDoH_proxyRejectsHTTP3(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name         string
+		address      string
+		httpVersions []HTTPVersion
+	}{{
+		name:         "http_versions",
+		address:      "https://dns.example/dns-query",
+		httpVersions: []HTTPVersion{HTTPVersion3, HTTPVersion2},
+	}, {
+		name:         "h3_scheme",
+		address:      "h3://dns.example/dns-query",
+		httpVersions: nil,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := AddressToUpstream(tc.address, &Options{
+				Logger:       slogutil.NewDiscardLogger(),
+				HTTPVersions: tc.httpVersions,
+				Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+					return nil, nil
+				},
+			})
+
+			testutil.AssertErrorMsg(t, "proxy is not supported for http/3", err)
+		})
+	}
+}
+
+// testHTTPProxy is a test HTTP proxy that tunnels CONNECT requests to their
+// target and counts them.
+type testHTTPProxy struct {
+	// url is the address of this proxy, ready to be returned from
+	// [Options.Proxy].
+	url *url.URL
+
+	// connects counts the CONNECT requests that reached this proxy.
+	connects *atomic.Int64
+}
+
+// startTestHTTPProxy starts an HTTP proxy on a random port.  Note that it adds
+// its own shutdown to the cleanup of t.
+func startTestHTTPProxy(t *testing.T) (p *testHTTPProxy) {
+	t.Helper()
+
+	p = &testHTTPProxy{
+		connects: &atomic.Int64{},
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	srv := &http.Server{
+		Handler:  http.HandlerFunc(p.serveHTTP),
+		ErrorLog: slog.NewLogLogger(slog.DiscardHandler, slog.LevelDebug),
+	}
+
+	go func() {
+		_ = srv.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+
+	p.url = &url.URL{
+		Scheme: "http",
+		Host:   listener.Addr().String(),
+	}
+
+	return p
+}
+
+// serveHTTP tunnels a CONNECT request to r.Host and shuttles bytes in both
+// directions until either side closes the connection.
+func (p *testHTTPProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodConnect {
+		http.Error(w, "only connect is supported", http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	p.connects.Add(1)
+
+	targetConn, err := net.Dial("tcp", r.Host)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+
+		return
+	}
+	defer func() {
+		_ = targetConn.Close()
+	}()
+
+	clientConn, _, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+
+		return
+	}
+	defer func() {
+		_ = clientConn.Close()
+	}()
+
+	_, err = clientConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+	if err != nil {
+		return
+	}
+
+	go func() {
+		_, _ = io.Copy(targetConn, clientConn)
+	}()
+
+	_, _ = io.Copy(clientConn, targetConn)
 }
