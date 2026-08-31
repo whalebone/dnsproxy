@@ -578,7 +578,10 @@ func checkProxyScheme(proxy ProxyFunc) (checked ProxyFunc) {
 //
 // The bootstrap is initialized here rather than by the caller, so that it only
 // runs if the upstream's own address is dialed, that is, if [Options.Proxy]
-// returned no proxy for a request.
+// returned no proxy for a request.  As a consequence it re-resolves on every
+// such dial instead of once per HTTP client, which is intentional: a direct
+// dial after a network change gets fresh bootstrap addresses without a client
+// reset.
 //
 // Note that a proxy hostname is resolved by the system resolver, since the
 // bootstrap of this upstream only knows how to reach the upstream.
