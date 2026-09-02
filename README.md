@@ -24,6 +24,7 @@ it can work as a `DNS-over-HTTPS`, `DNS-over-TLS` or `DNS-over-QUIC` server.
     - [Bogus NXDomain](#bogus-nxdomain)
     - [Basic Auth for DoH](#basic-auth-for-doh)
     - [Client Certificate Authentication for DoH](#client-certificate-authentication-for-doh)
+    - [Proxying DoH upstreams](#proxying-doh-upstreams)
 
 ## How to install
 
@@ -506,3 +507,25 @@ client-key: "/path/to/client.key"
 ```
 
 This feature also works with DNS-over-TLS (DoT) and DNS-over-QUIC (DoQ) upstreams that require client certificate authentication.
+
+### Proxying DoH upstreams
+
+Library users can route DNS-over-HTTPS upstreams through an HTTP proxy by setting `upstream.Options.Proxy`.  It has the same signature and semantics as [`http.Transport.Proxy`][http-transport-proxy]: it is consulted whenever a new connection is needed, and returning a `nil` URL makes that connection direct.
+
+```go
+u, err := upstream.AddressToUpstream("https://dns.example.com/dns-query", &upstream.Options{
+	Proxy: http.ProxyFromEnvironment,
+})
+```
+
+Note the following constraints:
+
+- The proxy is used for DoH only.  It has no effect on plain DNS, DoT, DoQ or DNSCrypt upstreams.
+- QUIC cannot traverse an HTTP `CONNECT` proxy, so `Proxy` cannot be combined with HTTP/3.  `AddressToUpstream` returns an error if `Proxy` is set together with `HTTPVersion3` in `HTTPVersions`, or with an `h3://` upstream address.
+- A proxied request needs no bootstrap: the proxy resolves the upstream's hostname itself, so no plain DNS lookup of the upstream is made.  The bootstrap is only used for a request that `Proxy` sends directly, and a bootstrap failure is then reported by that request rather than at upstream creation.
+- A proxy hostname, on the other hand, is resolved by the system resolver, not by the upstream's bootstrap.
+- `Proxy` is not consulted for a request served over a pooled connection.  In particular, an established HTTP/2 connection to the upstream is reused whatever `Proxy` would now return — in both directions: a pooled direct connection keeps bypassing a proxy that `Proxy` has started returning, and a pooled proxied tunnel keeps carrying requests it would now send directly.  To make a proxy configuration change take effect, close the upstream and create a new one; a failed exchange eventually resets the connection, but a working pooled connection is never re-evaluated.
+- The proxy URL scheme must be `http`, `socks5`, or `socks5h`; an empty scheme is treated as `http`.  An `https://` proxy is rejected: the transport would run the proxy TLS handshake with the upstream's own TLS configuration, verifying the proxy's certificate against the upstream's name and offering the upstream's client certificate to the proxy.
+- There is no command-line or configuration-file equivalent; `Proxy` is a library-only option.
+
+[http-transport-proxy]: https://pkg.go.dev/net/http#Transport

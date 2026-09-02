@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,12 +16,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/whalebone/dnsproxy/internal/bootstrap"
 )
 
 func TestUpstreamDoH(t *testing.T) {
@@ -538,4 +542,610 @@ func createDoHHandler() (h http.Handler) {
 	mux.HandleFunc("/dns-query", createDoHHandlerFunc())
 
 	return mux
+}
+
+// testProxyTimeout is the upstream timeout used by the proxy tests, long
+// enough not to fire before the assertion under test.
+const testProxyTimeout = 5 * time.Second
+
+func TestUpstreamDoH_proxy(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name                string
+		host                string
+		bootstrap           Resolver
+		wantConnects        int64
+		useProxy            bool
+		proxyReturnsURL     bool
+		proxyResolvesTarget bool
+	}{{
+		name:                "through_proxy",
+		host:                "",
+		bootstrap:           nil,
+		wantConnects:        1,
+		useProxy:            true,
+		proxyReturnsURL:     true,
+		proxyResolvesTarget: false,
+	}, {
+		name:                "direct_without_proxy",
+		host:                "",
+		bootstrap:           nil,
+		wantConnects:        0,
+		useProxy:            false,
+		proxyReturnsURL:     false,
+		proxyResolvesTarget: false,
+	}, {
+		// A proxy func that returns no proxy must still reach the upstream
+		// through its bootstrap, not through the system resolver.
+		name:                "bootstrapped_host_without_proxy_url",
+		host:                "dns.example",
+		bootstrap:           StaticResolver{netip.MustParseAddr("127.0.0.1")},
+		wantConnects:        0,
+		useProxy:            true,
+		proxyReturnsURL:     false,
+		proxyResolvesTarget: false,
+	}, {
+		// The upstream's address must match the dial target through the
+		// punycode conversion [http.Transport] applies, or the bootstrap
+		// branch is silently skipped.
+		name:                "idn_host_without_proxy_url",
+		host:                "bücher.example",
+		bootstrap:           StaticResolver{netip.MustParseAddr("127.0.0.1")},
+		wantConnects:        0,
+		useProxy:            true,
+		proxyReturnsURL:     false,
+		proxyResolvesTarget: false,
+	}, {
+		// [http.Transport] dials an ASCII host with its case preserved, while
+		// [transportAddr] folds it, so the match must be case-insensitive.
+		name:                "uppercase_host_without_proxy_url",
+		host:                "DNS.EXAMPLE",
+		bootstrap:           StaticResolver{netip.MustParseAddr("127.0.0.1")},
+		wantConnects:        0,
+		useProxy:            true,
+		proxyReturnsURL:     false,
+		proxyResolvesTarget: false,
+	}, {
+		// A proxied request needs no bootstrap at all, since the proxy resolves
+		// the upstream's hostname itself.  So a host that this machine cannot
+		// resolve, and no bootstrap to resolve it with, must still work.
+		name:                "unresolvable_host_through_proxy",
+		host:                "unresolvable.invalid",
+		bootstrap:           nil,
+		wantConnects:        1,
+		useProxy:            true,
+		proxyReturnsURL:     true,
+		proxyResolvesTarget: true,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := startDoHServer(t, testDoHServerOptions{})
+
+			srvAddr := srv.addr
+			if tc.host != "" {
+				_, port, err := net.SplitHostPort(srv.addr)
+				require.NoError(t, err)
+
+				srvAddr = net.JoinHostPort(tc.host, port)
+			}
+
+			proxyTarget := ""
+			if tc.proxyResolvesTarget {
+				proxyTarget = srv.addr
+			}
+
+			prx := startTestHTTPProxy(t, proxyTarget)
+
+			var proxyFunc ProxyFunc
+			if tc.useProxy {
+				proxyFunc = func(_ *http.Request) (proxyURL *url.URL, err error) {
+					if !tc.proxyReturnsURL {
+						return nil, nil
+					}
+
+					return prx.url, nil
+				}
+			}
+
+			address := fmt.Sprintf("https://%s/dns-query", srvAddr)
+			u, err := AddressToUpstream(address, &Options{
+				Logger:             slogutil.NewDiscardLogger(),
+				InsecureSkipVerify: true,
+				Bootstrap:          tc.bootstrap,
+				Proxy:              proxyFunc,
+			})
+			require.NoError(t, err)
+			testutil.CleanupAndRequireSuccess(t, u.Close)
+
+			checkUpstream(t, u, address)
+
+			assert.Equal(t, tc.wantConnects, prx.connects.Load())
+		})
+	}
+}
+
+// TestCheckProxyScheme asserts that the checked proxy func rejects the URL
+// schemes [http.Transport] would connect to with this upstream's own TLS
+// configuration, and passes everything else through untouched.
+func TestCheckProxyScheme(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		scheme     string
+		wantErrMsg string
+	}{{
+		name:       "empty",
+		scheme:     "",
+		wantErrMsg: "",
+	}, {
+		name:       "http",
+		scheme:     "http",
+		wantErrMsg: "",
+	}, {
+		name:       "socks5",
+		scheme:     "socks5",
+		wantErrMsg: "",
+	}, {
+		name:       "socks5h",
+		scheme:     "socks5h",
+		wantErrMsg: "",
+	}, {
+		name:       "https",
+		scheme:     "https",
+		wantErrMsg: `proxy scheme "https" is not supported`,
+	}, {
+		name:       "ftp",
+		scheme:     "ftp",
+		wantErrMsg: `proxy scheme "ftp" is not supported`,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			in := &url.URL{Scheme: tc.scheme, Host: "proxy.example:3128"}
+			checked := checkProxyScheme(func(_ *http.Request) (proxyURL *url.URL, err error) {
+				return in, nil
+			})
+
+			out, err := checked(nil)
+
+			if tc.wantErrMsg == "" {
+				require.NoError(t, err)
+				assert.Same(t, in, out)
+			} else {
+				require.Error(t, err)
+				assert.Equal(t, tc.wantErrMsg, err.Error())
+				assert.Nil(t, out)
+			}
+		})
+	}
+
+	t.Run("nil_func", func(t *testing.T) {
+		t.Parallel()
+
+		assert.Nil(t, checkProxyScheme(nil))
+	})
+
+	t.Run("no_proxy", func(t *testing.T) {
+		t.Parallel()
+
+		checked := checkProxyScheme(func(_ *http.Request) (proxyURL *url.URL, err error) {
+			return nil, nil
+		})
+
+		out, err := checked(nil)
+
+		require.NoError(t, err)
+		assert.Nil(t, out)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		t.Parallel()
+
+		checked := checkProxyScheme(func(_ *http.Request) (proxyURL *url.URL, err error) {
+			return nil, assert.AnError
+		})
+
+		_, err := checked(nil)
+
+		assert.ErrorIs(t, err, assert.AnError)
+	})
+}
+
+// TestUpstreamDoH_proxyScheme asserts the scheme handling end to end: a proxy
+// URL with no scheme, which is what the Windows PAC resolution produces, is
+// used as a plain HTTP proxy, while an https one is rejected before any
+// connection is made.
+func TestUpstreamDoH_proxyScheme(t *testing.T) {
+	t.Parallel()
+
+	srv := startDoHServer(t, testDoHServerOptions{})
+	address := fmt.Sprintf("https://%s/dns-query", srv.addr)
+
+	t.Run("empty_scheme_via_proxy", func(t *testing.T) {
+		t.Parallel()
+
+		prx := startTestHTTPProxy(t, "")
+
+		u, err := AddressToUpstream(address, &Options{
+			Logger:             slogutil.NewDiscardLogger(),
+			InsecureSkipVerify: true,
+			Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+				return &url.URL{Host: prx.url.Host}, nil
+			},
+		})
+		require.NoError(t, err)
+		testutil.CleanupAndRequireSuccess(t, u.Close)
+
+		checkUpstream(t, u, address)
+
+		assert.Equal(t, int64(1), prx.connects.Load())
+	})
+
+	t.Run("https_scheme_rejected", func(t *testing.T) {
+		t.Parallel()
+
+		u, err := AddressToUpstream(address, &Options{
+			Logger:             slogutil.NewDiscardLogger(),
+			InsecureSkipVerify: true,
+			Timeout:            testProxyTimeout,
+			Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+				return &url.URL{Scheme: "https", Host: "proxy.invalid:3128"}, nil
+			},
+		})
+		require.NoError(t, err)
+		testutil.CleanupAndRequireSuccess(t, u.Close)
+
+		_, err = u.Exchange(createTestMessage())
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `proxy scheme "https" is not supported`)
+	})
+}
+
+// TestUpstreamDoH_proxyDirectBootstrapFailure asserts that deferring the
+// bootstrap of a proxied upstream doesn't swallow its failure: a request that
+// the proxy func sends directly still reports that the upstream could not be
+// bootstrapped.
+func TestUpstreamDoH_proxyDirectBootstrapFailure(t *testing.T) {
+	t.Parallel()
+
+	u, err := AddressToUpstream("https://dns.example/dns-query", &Options{
+		Logger:    slogutil.NewDiscardLogger(),
+		Bootstrap: errTestResolver{},
+		Timeout:   testProxyTimeout,
+		Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+			return nil, nil
+		},
+	})
+	require.NoError(t, err)
+	testutil.CleanupAndRequireSuccess(t, u.Close)
+
+	_, err = u.Exchange(createTestMessage())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bootstrapping")
+}
+
+// TestUpstreamDoH_proxyThenDirect asserts that an upstream which has already
+// served a proxied request can still fall back to a direct one, initializing
+// its bootstrap only then.
+//
+// Note that [Options.Proxy] is consulted only when a new connection is needed,
+// not per request: with HTTP/2 the established tunnel is reused for the same
+// authority whatever the proxy func says.  So the test closes it in between.
+func TestUpstreamDoH_proxyThenDirect(t *testing.T) {
+	t.Parallel()
+
+	srv := startDoHServer(t, testDoHServerOptions{})
+	prx := startTestHTTPProxy(t, srv.addr)
+
+	_, port, err := net.SplitHostPort(srv.addr)
+	require.NoError(t, err)
+
+	// Use a hostname that only the bootstrap can resolve, so that the direct
+	// request cannot succeed without it.
+	address := fmt.Sprintf("https://%s/dns-query", net.JoinHostPort("dns.example", port))
+
+	proxied := &atomic.Bool{}
+	proxied.Store(true)
+
+	u, err := AddressToUpstream(address, &Options{
+		Logger:             slogutil.NewDiscardLogger(),
+		InsecureSkipVerify: true,
+		Bootstrap:          StaticResolver{netip.MustParseAddr("127.0.0.1")},
+		Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+			if !proxied.Load() {
+				return nil, nil
+			}
+
+			return prx.url, nil
+		},
+	})
+	require.NoError(t, err)
+	testutil.CleanupAndRequireSuccess(t, u.Close)
+
+	checkUpstream(t, u, address)
+	require.Equal(t, int64(1), prx.connects.Load())
+
+	transport := testutil.RequireTypeAssert[*http.Transport](t, u.(*dnsOverHTTPS).client.Transport)
+	transport.CloseIdleConnections()
+	proxied.Store(false)
+
+	checkUpstream(t, u, address)
+
+	assert.Equal(t, int64(1), prx.connects.Load())
+}
+
+// TestUpstreamDoH_directThenProxy pins that a pooled HTTP/2 connection
+// bypasses [Options.Proxy] in the direction that matters for policy: an
+// upstream that has served a direct request keeps using the pooled connection
+// even after the proxy func starts returning a proxy.  A consumer whose proxy
+// configuration changed must close this upstream and create a new one.
+//
+// If a Go or x/net update starts consulting the proxy func on the pooled
+// path, this test fails, surfacing the semantics change instead of letting it
+// happen silently.
+func TestUpstreamDoH_directThenProxy(t *testing.T) {
+	t.Parallel()
+
+	srv := startDoHServer(t, testDoHServerOptions{})
+	prx := startTestHTTPProxy(t, srv.addr)
+
+	address := fmt.Sprintf("https://%s/dns-query", srv.addr)
+
+	proxied := &atomic.Bool{}
+
+	u, err := AddressToUpstream(address, &Options{
+		Logger:             slogutil.NewDiscardLogger(),
+		InsecureSkipVerify: true,
+		Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+			if !proxied.Load() {
+				return nil, nil
+			}
+
+			return prx.url, nil
+		},
+	})
+	require.NoError(t, err)
+	testutil.CleanupAndRequireSuccess(t, u.Close)
+
+	checkUpstream(t, u, address)
+	require.Equal(t, int64(0), prx.connects.Load())
+
+	proxied.Store(true)
+
+	checkUpstream(t, u, address)
+
+	assert.Equal(t, int64(0), prx.connects.Load())
+}
+
+// TestTransportAddr asserts that the address [transportAddr] derives matches
+// what [http.Transport] dials, over the host shapes that differ under the
+// conversion: internationalized names, punycode, case, and the hosts the
+// lookup profile rejects, which must fall back to the verbatim host.
+func TestTransportAddr(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		host string
+		want string
+	}{{
+		name: "ascii",
+		host: "dns.example:443",
+		want: "dns.example:443",
+	}, {
+		name: "ascii_upper",
+		host: "DNS.EXAMPLE:443",
+		want: "dns.example:443",
+	}, {
+		name: "trailing_dot",
+		host: "dns.example.:443",
+		want: "dns.example.:443",
+	}, {
+		name: "punycode",
+		host: "xn--bcher-kva.example:443",
+		want: "xn--bcher-kva.example:443",
+	}, {
+		name: "punycode_upper",
+		host: "XN--BCHER-KVA.example:443",
+		want: "xn--bcher-kva.example:443",
+	}, {
+		name: "idn",
+		host: "bücher.example:443",
+		want: "xn--bcher-kva.example:443",
+	}, {
+		name: "idn_nontransitional",
+		host: "faß.de:443",
+		want: "xn--fa-hia.de:443",
+	}, {
+		name: "underscore_label",
+		host: "_dmarc.example.com:443",
+		want: "_dmarc.example.com:443",
+	}, {
+		name: "leading_hyphen_label",
+		host: "-foo.example:443",
+		want: "-foo.example:443",
+	}, {
+		name: "empty_label",
+		host: "foo..example:443",
+		want: "foo..example:443",
+	}, {
+		name: "invalid_punycode",
+		host: "xn--a.example:443",
+		want: "xn--a.example:443",
+	}, {
+		name: "ipv4",
+		host: "127.0.0.1:443",
+		want: "127.0.0.1:443",
+	}, {
+		name: "ipv6",
+		host: "[::1]:443",
+		want: "[::1]:443",
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			u := &url.URL{Host: tc.host}
+
+			assert.Equal(t, tc.want, transportAddr(u))
+		})
+	}
+}
+
+// errTestResolver is a [Resolver] that always fails.  It exercises bootstrap
+// failures without depending on the resolver of the machine running the test.
+type errTestResolver struct{}
+
+// type check
+var _ Resolver = errTestResolver{}
+
+// LookupNetIP implements the [Resolver] interface for errTestResolver.
+func (errTestResolver) LookupNetIP(
+	_ context.Context,
+	_ bootstrap.Network,
+	_ string,
+) (addrs []netip.Addr, err error) {
+	return nil, errors.Error("test resolver failure")
+}
+
+func TestUpstreamDoH_proxyRejectsHTTP3(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name         string
+		address      string
+		httpVersions []HTTPVersion
+	}{{
+		name:         "http_versions",
+		address:      "https://dns.example/dns-query",
+		httpVersions: []HTTPVersion{HTTPVersion3, HTTPVersion2},
+	}, {
+		name:         "h3_scheme",
+		address:      "h3://dns.example/dns-query",
+		httpVersions: nil,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := AddressToUpstream(tc.address, &Options{
+				Logger:       slogutil.NewDiscardLogger(),
+				HTTPVersions: tc.httpVersions,
+				Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+					return nil, nil
+				},
+			})
+
+			testutil.AssertErrorMsg(t, "proxy is not supported for http/3", err)
+		})
+	}
+}
+
+// testHTTPProxy is a test HTTP proxy that tunnels CONNECT requests to their
+// target and counts them.
+type testHTTPProxy struct {
+	// url is the address of this proxy, ready to be returned from
+	// [Options.Proxy].
+	url *url.URL
+
+	// connects counts the CONNECT requests that reached this proxy.
+	connects *atomic.Int64
+
+	// target is the address to tunnel to, regardless of what the CONNECT
+	// request asks for.  If empty, the request's own host is used.
+	target string
+}
+
+// startTestHTTPProxy starts an HTTP proxy on a random port.  If target is not
+// empty, the proxy tunnels to it instead of to the host of the CONNECT request,
+// emulating a proxy that resolves the target's hostname itself.  Note that it
+// adds its own shutdown to the cleanup of t.
+func startTestHTTPProxy(t *testing.T, target string) (p *testHTTPProxy) {
+	t.Helper()
+
+	p = &testHTTPProxy{
+		target:   target,
+		connects: &atomic.Int64{},
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	srv := &http.Server{
+		Handler:  http.HandlerFunc(p.serveHTTP),
+		ErrorLog: slog.NewLogLogger(slog.DiscardHandler, slog.LevelDebug),
+	}
+
+	go func() {
+		_ = srv.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+
+	p.url = &url.URL{
+		Scheme: "http",
+		Host:   listener.Addr().String(),
+	}
+
+	return p
+}
+
+// serveHTTP tunnels a CONNECT request to r.Host and shuttles bytes in both
+// directions until either side closes the connection.
+func (p *testHTTPProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodConnect {
+		http.Error(w, "only connect is supported", http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	p.connects.Add(1)
+
+	targetAddr := p.target
+	if targetAddr == "" {
+		targetAddr = r.Host
+	}
+
+	targetConn, err := net.Dial("tcp", targetAddr)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+
+		return
+	}
+	defer func() {
+		_ = targetConn.Close()
+	}()
+
+	clientConn, _, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+
+		return
+	}
+	defer func() {
+		_ = clientConn.Close()
+	}()
+
+	_, err = clientConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+	if err != nil {
+		return
+	}
+
+	go func() {
+		_, _ = io.Copy(targetConn, clientConn)
+	}()
+
+	_, _ = io.Copy(clientConn, targetConn)
 }

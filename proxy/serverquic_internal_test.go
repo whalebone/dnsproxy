@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/robcza/dnsproxy/proxyutil"
+	"github.com/whalebone/dnsproxy/proxyutil"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/miekg/dns"

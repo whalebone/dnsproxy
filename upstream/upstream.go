@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
@@ -17,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/robcza/dnsproxy/internal/bootstrap"
+	"github.com/whalebone/dnsproxy/internal/bootstrap"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
@@ -53,6 +54,11 @@ type QUICTraceFunc func(
 	connID quic.ConnectionID,
 ) (tracer *logging.ConnectionTracer)
 
+// ProxyFunc returns the proxy through which a request should be sent, in the
+// same way as [http.Transport.Proxy].  A nil URL means the request is sent
+// directly.
+type ProxyFunc func(req *http.Request) (proxyURL *url.URL, err error)
+
 // Options for AddressToUpstream func.  With these options we can configure the
 // upstream properties.
 type Options struct {
@@ -76,6 +82,30 @@ type Options struct {
 	// QUICTracer is an optional callback that allows tracing every QUIC
 	// connection and logging every packet that goes through.
 	QUICTracer QUICTraceFunc
+
+	// Proxy is an optional callback returning the proxy to send a
+	// DNS-over-HTTPS request through.  If nil, requests are sent directly.
+	//
+	// It is consulted when a new connection is needed, not per request.  A
+	// pooled HTTP/2 connection to the upstream is reused whatever Proxy would
+	// now return, in both directions: a direct connection established while
+	// Proxy returned nil keeps bypassing a proxy it has started returning,
+	// and a proxied tunnel keeps carrying requests it would now send
+	// directly.  On a proxy configuration change, close this upstream and
+	// create a new one rather than waiting for a failed exchange to reset the
+	// connection.
+	//
+	// QUIC cannot traverse an HTTP CONNECT proxy, so Proxy must not be
+	// combined with [HTTPVersion3]; doing so is an error.  Note that it has no
+	// effect on protocols other than DNS-over-HTTPS.
+	//
+	// The returned URL's scheme must be "http", "socks5", "socks5h", or empty,
+	// which is treated as "http".  An "https" proxy URL is rejected when
+	// returned:
+	// [http.Transport] would run the TLS handshake with the proxy using this
+	// upstream's own TLS configuration, whose server name, root pool, and
+	// client certificate all belong to the upstream, not the proxy.
+	Proxy ProxyFunc
 
 	// RootCAs is the CertPool that must be used by all upstreams.  Redefining
 	// RootCAs makes sense on iOS to overcome the 15MB memory limit of the
@@ -130,6 +160,7 @@ func (o *Options) Clone() (clone *Options) {
 		Logger:                    o.Logger,
 		ClientCertPath:            o.ClientCertPath,
 		ClientKeyPath:             o.ClientKeyPath,
+		Proxy:                     o.Proxy,
 	}
 }
 
@@ -249,7 +280,7 @@ func validateUpstreamURL(u *url.URL) (err error) {
 	if l := len(host); l >= minEnclosedIPv6Len && host[0] == '[' && host[l-1] == ']' {
 		// Might be an IPv6 address enclosed in square brackets with no port.
 		//
-		// See https://github.com/robcza/dnsproxy/issues/379.
+		// See https://github.com/AdguardTeam/dnsproxy/issues/379.
 		possibleIP = host[1 : l-1]
 	}
 	if netutil.IsValidIPString(possibleIP) {

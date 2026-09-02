@@ -13,7 +13,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/robcza/dnsproxy/internal/bootstrap"
+	"github.com/whalebone/dnsproxy/internal/bootstrap"
 	"github.com/AdguardTeam/golibs/httphdr"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/miekg/dns"

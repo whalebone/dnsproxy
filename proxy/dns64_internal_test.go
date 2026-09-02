@@ -7,8 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/robcza/dnsproxy/internal/dnsproxytest"
-	"github.com/robcza/dnsproxy/upstream"
+	"github.com/whalebone/dnsproxy/internal/dnsproxytest"
+	"github.com/whalebone/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/testutil"

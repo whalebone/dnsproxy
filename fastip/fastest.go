@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/robcza/dnsproxy/upstream"
+	"github.com/whalebone/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/cache"
 	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"

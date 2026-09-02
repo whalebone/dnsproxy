@@ -3,7 +3,7 @@ package proxy_test
 import (
 	"testing"
 
-	"github.com/robcza/dnsproxy/proxy"
+	"github.com/whalebone/dnsproxy/proxy"
 	"github.com/AdguardTeam/golibs/testutil"
 )
 

@@ -8,7 +8,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/robcza/dnsproxy/internal/version"
+	"github.com/whalebone/dnsproxy/internal/version"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/osutil"
 	"github.com/AdguardTeam/golibs/timeutil"

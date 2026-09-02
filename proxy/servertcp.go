@@ -9,8 +9,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/robcza/dnsproxy/internal/bootstrap"
-	proxynetutil "github.com/robcza/dnsproxy/internal/netutil"
+	"github.com/whalebone/dnsproxy/internal/bootstrap"
+	proxynetutil "github.com/whalebone/dnsproxy/internal/netutil"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"

@@ -3,7 +3,7 @@ package proxy
 import (
 	"testing"
 
-	"github.com/robcza/dnsproxy/upstream"
+	"github.com/whalebone/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
@@ -478,7 +478,7 @@ func BenchmarkGetUpstreamsForDomain(b *testing.B) {
 	//
 	//	goos: darwin
 	//	goarch: amd64
-	//	pkg: github.com/robcza/dnsproxy/proxy
+	//	pkg: github.com/whalebone/dnsproxy/proxy
 	//	cpu: Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz
 	//	BenchmarkGetUpstreamsForDomain/get-12         	22438213	        46.05 ns/op	       0 B/op	       0 allocs/op
 }

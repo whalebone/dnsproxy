@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/rsa"
@@ -11,8 +12,10 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -20,8 +23,11 @@ import (
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/testutil"
+	"github.com/ameshkov/dnscrypt/v2"
 	"github.com/ameshkov/dnsstamps"
 	"github.com/miekg/dns"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/logging"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -31,6 +37,68 @@ import (
 // TODO(d.kolyshev): Remove this after quic-go has migrated to slog.
 func TestMain(m *testing.M) {
 	testutil.DiscardLogOutput(m)
+}
+
+// TestOptions_Clone asserts that every field of [Options] survives a Clone.
+// Clone enumerates the fields explicitly, so a newly added field is silently
+// dropped unless it is added there too.  Note that func fields cannot be
+// compared, so they are only checked for being set.
+func TestOptions_Clone(t *testing.T) {
+	t.Parallel()
+
+	orig := &Options{
+		Logger: slogutil.NewDiscardLogger(),
+		VerifyServerCertificate: func(_ [][]byte, _ [][]*x509.Certificate) (err error) {
+			return nil
+		},
+		VerifyConnection: func(_ tls.ConnectionState) (err error) {
+			return nil
+		},
+		VerifyDNSCryptCertificate: func(_ *dnscrypt.Cert) (err error) {
+			return nil
+		},
+		QUICTracer: func(
+			_ context.Context,
+			_ logging.Perspective,
+			_ quic.ConnectionID,
+		) (tracer *logging.ConnectionTracer) {
+			return nil
+		},
+		RootCAs:            x509.NewCertPool(),
+		CipherSuites:       []uint16{tls.TLS_AES_128_GCM_SHA256},
+		Bootstrap:          net.DefaultResolver,
+		HTTPVersions:       []HTTPVersion{HTTPVersion2},
+		Timeout:            time.Second,
+		InsecureSkipVerify: true,
+		PreferIPv6:         true,
+		ClientCertPath:     "client.crt",
+		ClientKeyPath:      "client.key",
+		Proxy: func(_ *http.Request) (proxyURL *url.URL, err error) {
+			return nil, nil
+		},
+	}
+
+	origVal := reflect.ValueOf(*orig)
+	for i := range origVal.NumField() {
+		name := origVal.Type().Field(i).Name
+		require.Falsef(t, origVal.Field(i).IsZero(), "field %s must be set by this test", name)
+	}
+
+	clone := orig.Clone()
+
+	cloneVal := reflect.ValueOf(*clone)
+	for i := range cloneVal.NumField() {
+		name := cloneVal.Type().Field(i).Name
+		cloneField := cloneVal.Field(i)
+
+		if cloneField.Kind() == reflect.Func {
+			assert.Falsef(t, cloneField.IsZero(), "func field %s is dropped by Clone", name)
+
+			continue
+		}
+
+		assert.Equalf(t, origVal.Field(i).Interface(), cloneField.Interface(), "field %s", name)
+	}
 }
 
 func TestUpstream_bootstrapTimeout(t *testing.T) {

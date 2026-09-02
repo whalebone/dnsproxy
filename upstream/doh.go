@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/robcza/dnsproxy/internal/bootstrap"
+	"github.com/whalebone/dnsproxy/internal/bootstrap"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/httphdr"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
@@ -22,6 +24,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/idna"
 )
 
 // Values to configure HTTP and HTTP/2 transport.
@@ -36,7 +39,7 @@ const (
 
 	// dohMaxConnsPerHost controls the maximum number of connections for
 	// each host.  Note, that setting it to 1 may cause issues with Go's http
-	// implementation, see https://github.com/robcza/dnsproxy/issues/278.
+	// implementation, see https://github.com/AdguardTeam/dnsproxy/issues/278.
 	dohMaxConnsPerHost = 2
 
 	// dohMaxIdleConns controls the maximum number of connections being idle
@@ -44,12 +47,21 @@ const (
 	dohMaxIdleConns = 2
 )
 
+// errProxyH3 is returned when a DNS-over-HTTPS upstream is configured with both
+// a proxy and HTTP/3.  QUIC cannot traverse an HTTP CONNECT proxy, so allowing
+// both would send the queries around the proxy instead of through it.
+const errProxyH3 errors.Error = "proxy is not supported for http/3"
+
 // dnsOverHTTPS is a struct that implements the Upstream interface for the
 // DNS-over-HTTPS protocol.
 type dnsOverHTTPS struct {
 	// getDialer either returns an initialized dial handler or creates a new
 	// one.
 	getDialer DialerInitializer
+
+	// proxy returns the proxy to send a request through, or nil for a direct
+	// connection.  It is nil if no proxy is configured at all.
+	proxy ProxyFunc
 
 	// addr is the DNS-over-HTTPS server URL.
 	addr *url.URL
@@ -98,6 +110,10 @@ func newDoH(addr *url.URL, opts *Options) (u Upstream, err error) {
 		httpVersions = DefaultHTTPVersions
 	}
 
+	if opts.Proxy != nil && slices.Contains(httpVersions, HTTPVersion3) {
+		return nil, errProxyH3
+	}
+
 	tlsConf := &tls.Config{
 		ServerName:   addr.Hostname(),
 		RootCAs:      opts.RootCAs,
@@ -125,6 +141,7 @@ func newDoH(addr *url.URL, opts *Options) (u Upstream, err error) {
 
 	ups := &dnsOverHTTPS{
 		getDialer: newDialerInitializer(addr, opts),
+		proxy:     checkProxyScheme(opts.Proxy),
 		addr:      addr,
 		quicConf: &quic.Config{
 			KeepAlivePeriod: QUICKeepAlivePeriod,
@@ -283,7 +300,7 @@ func (p *dnsOverHTTPS) exchangeHTTPSClient(
 	}
 
 	// Prevent the client from sending User-Agent header, see
-	// https://github.com/robcza/dnsproxy/issues/211.
+	// https://github.com/AdguardTeam/dnsproxy/issues/211.
 	httpReq.Header.Set(httphdr.UserAgent, "")
 	httpReq.Header.Set(httphdr.Accept, "application/dns-message")
 
@@ -449,6 +466,21 @@ func (p *dnsOverHTTPS) createClient() (*http.Client, error) {
 // HTTP3 is enabled in the upstream options).  If this attempt is successful,
 // it returns an HTTP3 transport, otherwise it returns the H1/H2 transport.
 func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
+	tlsConf := p.tlsConf.Clone()
+
+	if p.proxy != nil {
+		// A proxied request needs no bootstrap at all: [http.Transport] dials
+		// the proxy, and the proxy resolves this upstream's hostname itself.
+		// So the bootstrap is deferred to the dial handler, which needs it only
+		// if a request turns out to be sent directly.  Otherwise a network that
+		// permits no plain DNS, which is the very reason to use a proxy, could
+		// not bring this upstream up at all.
+		//
+		// Note that HTTP/3 cannot be reached from here, since [newDoH] rejects
+		// a proxy combined with it.
+		return p.newTransportH1H2(tlsConf, p.proxyDialContext())
+	}
+
 	dialContext, err := p.getDialer()
 	if err != nil {
 		return nil, fmt.Errorf("bootstrapping %s: %w", p.addrRedacted, err)
@@ -457,7 +489,6 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 	// First, we attempt to create an HTTP3 transport.  If the probe QUIC
 	// connection is established successfully, we'll be using HTTP3 for this
 	// upstream.
-	tlsConf := p.tlsConf.Clone()
 	transportH3, err := p.createTransportH3(tlsConf, dialContext)
 	if err == nil {
 		p.logger.Debug("using http/3 for this upstream, quic was faster")
@@ -467,12 +498,23 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 
 	p.logger.Debug("got error, switching to http/2 for this upstream", slogutil.KeyError, err)
 
+	return p.newTransportH1H2(tlsConf, dialContext)
+}
+
+// newTransportH1H2 returns an HTTP/1.1 and HTTP/2 transport for this upstream
+// that dials with dialContext.  Note that it also sets p.transportH2, so that
+// the HTTP/2 transport can be configured after the fact.
+func (p *dnsOverHTTPS) newTransportH1H2(
+	tlsConf *tls.Config,
+	dialContext bootstrap.DialHandler,
+) (t http.RoundTripper, err error) {
 	if !p.supportsHTTP() {
 		return nil, errors.Error("HTTP1/1 and HTTP2 are not supported by this upstream")
 	}
 
 	transport := &http.Transport{
 		TLSClientConfig:    tlsConf,
+		Proxy:              p.proxy,
 		DisableCompression: true,
 		DialContext:        dialContext,
 		IdleConnTimeout:    transportDefaultIdleConnTimeout,
@@ -486,7 +528,7 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 
 	// Explicitly configure transport to use HTTP/2.
 	//
-	// See https://github.com/robcza/dnsproxy/issues/11.
+	// See https://github.com/AdguardTeam/dnsproxy/issues/11.
 	p.transportH2, err = http2.ConfigureTransports(transport)
 	if err != nil {
 		return nil, err
@@ -496,6 +538,105 @@ func (p *dnsOverHTTPS) createTransport() (t http.RoundTripper, err error) {
 	p.transportH2.ReadIdleTimeout = transportDefaultReadIdleTimeout
 
 	return transport, nil
+}
+
+// checkProxyScheme wraps proxy to reject the URL schemes that [http.Transport]
+// would connect to using this upstream's own TLS configuration.  That
+// configuration pins the upstream's server name, root pool, and client
+// certificate, none of which apply to a proxy, so an "https" proxy would fail
+// its certificate verification and be offered the upstream's client
+// certificate.  An empty scheme is accepted since the transport treats it as
+// "http"; the Windows PAC resolution produces such URLs.
+//
+// It is applied here, per returned URL, rather than at construction, since a
+// proxy func may return a different URL for every request.
+func checkProxyScheme(proxy ProxyFunc) (checked ProxyFunc) {
+	if proxy == nil {
+		return nil
+	}
+
+	return func(req *http.Request) (proxyURL *url.URL, err error) {
+		proxyURL, err = proxy(req)
+		if err != nil || proxyURL == nil {
+			return proxyURL, err
+		}
+
+		switch proxyURL.Scheme {
+		case "", "http", "socks5", "socks5h":
+			return proxyURL, nil
+		default:
+			return nil, fmt.Errorf("proxy scheme %q is not supported", proxyURL.Scheme)
+		}
+	}
+}
+
+// proxyDialContext returns the dial handler for an upstream that has a proxy
+// configured.  The bootstrap dials the bootstrapped addresses of this upstream
+// regardless of the address it is asked for, which is wrong once a proxy is in
+// play: [http.Transport] asks for the proxy's address, not the upstream's.  So
+// anything but the upstream's own address is dialed as given.
+//
+// The bootstrap is initialized here rather than by the caller, so that it only
+// runs if the upstream's own address is dialed, that is, if [Options.Proxy]
+// returned no proxy for a request.  As a consequence it re-resolves on every
+// such dial instead of once per HTTP client, which is intentional: a direct
+// dial after a network change gets fresh bootstrap addresses without a client
+// reset.
+//
+// Note that a proxy hostname is resolved by the system resolver, since the
+// bootstrap of this upstream only knows how to reach the upstream.
+func (p *dnsOverHTTPS) proxyDialContext() (h bootstrap.DialHandler) {
+	upsAddr := transportAddr(p.addr)
+	dialer := &net.Dialer{
+		Timeout: p.timeout,
+	}
+
+	return func(
+		ctx context.Context,
+		network bootstrap.Network,
+		addr string,
+	) (conn net.Conn, err error) {
+		if !strings.EqualFold(addr, upsAddr) {
+			p.logger.DebugContext(ctx, "dialing proxy", "addr", addr)
+
+			return dialer.DialContext(ctx, network, addr)
+		}
+
+		// Note that the bootstrap runs on its own context with the upstream
+		// timeout, see [bootstrap.ResolveDialContext], so ctx does not cancel
+		// it.  A stalled bootstrap therefore holds this dial for up to that
+		// timeout even if the request is already gone.
+		boot, err := p.getDialer()
+		if err != nil {
+			return nil, fmt.Errorf("bootstrapping %s: %w", p.addrRedacted, err)
+		}
+
+		return boot(ctx, network, addr)
+	}
+}
+
+// transportAddr returns the host:port of u the way [http.Transport] derives the
+// address it dials, so that the two can be compared.  Note that u always has a
+// port here, since [addPort] has run on it.
+func transportAddr(u *url.URL) (addr string) {
+	host := u.Hostname()
+
+	// Convert to punycode as [http.Transport] does, so that an
+	// internationalized domain name still matches.  A host that cannot be
+	// converted is compared as is: the worst case is that it never matches,
+	// and the upstream is dialed directly instead of through its bootstrap.
+	//
+	// The transport skips the conversion for an ASCII host, keeping its case,
+	// while [idna.Lookup] folds it; a host the lookup profile rejects falls
+	// back to the verbatim host here, which is what the transport dials too.
+	// Case is therefore the only divergence between the two derivations, and
+	// the comparison in [dnsOverHTTPS.proxyDialContext] absorbs it with
+	// [strings.EqualFold].
+	if ascii, err := idna.Lookup.ToASCII(host); err == nil {
+		host = ascii
+	}
+
+	return net.JoinHostPort(host, u.Port())
 }
 
 // http3Transport is a wrapper over [*http3.Transport] that tries to optimize

@@ -9,7 +9,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/robcza/dnsproxy/upstream"
+	"github.com/whalebone/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/ameshkov/dnscrypt/v2"
