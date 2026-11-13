@@ -1,6 +1,6 @@
 module github.com/whalebone/dnsproxy
 
-go 1.24.2
+go 1.26.0
 
 require (
 	github.com/AdguardTeam/golibs v0.32.9
@@ -13,7 +13,7 @@ require (
 	// TODO(s.chzhen):  Update after investigation of the 0-RTT bug/behavior
 	// when TestUpstreamDoH_serverRestart/http3/second_try keeps failing.
 	github.com/quic-go/quic-go v0.48.2
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.12.1
 	golang.org/x/exp v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
 	golang.org/x/net v0.39.0
 	golang.org/x/sys v0.33.0
@@ -30,10 +30,10 @@ require (
 	cloud.google.com/go/longrunning v0.6.6 // indirect
 	github.com/BurntSushi/toml v1.5.0 // indirect
 	github.com/ccojocar/zxcvbn-go v1.0.4 // indirect
-	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/fzipp/gocyclo v0.6.0 // indirect
-	github.com/go-logr/logr v1.4.2 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
 	github.com/golangci/misspell v0.6.0 // indirect
@@ -50,21 +50,22 @@ require (
 	github.com/jstemmer/go-junit-report/v2 v2.1.0 // indirect
 	github.com/kisielk/errcheck v1.9.0 // indirect
 	github.com/onsi/ginkgo/v2 v2.23.4 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/quic-go/qpack v0.5.1 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/securego/gosec/v2 v2.22.3 // indirect
 	github.com/uudashr/gocognit v1.2.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
+	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.60.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.60.0 // indirect
-	go.opentelemetry.io/otel v1.35.0 // indirect
-	go.opentelemetry.io/otel/metric v1.35.0 // indirect
-	go.opentelemetry.io/otel/trace v1.35.0 // indirect
+	go.opentelemetry.io/otel v1.47.0 // indirect
+	go.opentelemetry.io/otel/log v1.47.0 // indirect
+	go.opentelemetry.io/otel/metric v1.47.0 // indirect
+	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	go.uber.org/automaxprocs v1.6.0 // indirect
 	go.uber.org/mock v0.5.2 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.37.0 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
 	golang.org/x/mod v0.24.0 // indirect
